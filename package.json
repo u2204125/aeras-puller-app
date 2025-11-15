@@ -15,7 +15,7 @@
     "vite",
     "zustand",
     "socket-io",
-    "mqtt",
+    "websocket",
     "offline-first",
     "e-rickshaw",
     "puller-app",

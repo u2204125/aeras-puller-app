@@ -91,7 +91,7 @@ class ApiService {
 
   /**
    * Puller Authentication using phone number
-   * After successful login, connects to WebSocket and publishes data to MQTT
+   * After successful login, connects to WebSocket for real-time communication
    */
   async loginPuller(phone: string): Promise<Puller> {
     try {
@@ -116,7 +116,6 @@ class ApiService {
         console.warn('⚠️  WebSocket connection failed, will fallback to HTTP:', wsError);
       }
 
-      // Backend already published puller data to MQTT on login
       return puller;
     } catch (error: any) {
       console.error('Login error:', error);
@@ -168,6 +167,16 @@ class ApiService {
         lon,
       });
     }
+  }
+
+  /**
+   * Update puller's points balance
+   */
+  async updatePullerPoints(pullerId: number, newBalance: number): Promise<Puller> {
+    const response = await this.api.patch<Puller>(`/pullers/${pullerId}/points`, {
+      pointsBalance: newBalance,
+    });
+    return response.data;
   }
 
   /**

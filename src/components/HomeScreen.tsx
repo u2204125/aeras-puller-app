@@ -1,6 +1,8 @@
+import { useState } from 'react';
 import { useAppStore } from '../store/appStore';
+import { useSocket } from '../hooks/useSocket';
 import { apiService } from '../services/api.service';
-import { mqttService } from '../services/mqtt.service';
+import { socketService } from '../services/socket.service';
 import { formatPoints } from '../utils/helpers';
 
 /**
@@ -20,30 +22,48 @@ interface HomeScreenProps {
 }
 
 export const HomeScreen: React.FC<HomeScreenProps> = ({ onViewHistory, onViewAvailableRides }) => {
+  const { isConnected } = useSocket();
   const puller = useAppStore((state) => state.puller);
   const isOnline = useAppStore((state) => state.isOnline);
-  const isConnected = useAppStore((state) => state.isConnected);
   const availableRides = useAppStore((state) => state.availableRides);
   const setIsOnline = useAppStore((state) => state.setIsOnline);
   const setPuller = useAppStore((state) => state.setPuller);
   const reset = useAppStore((state) => state.reset);
 
+  const [isToggling, setIsToggling] = useState(false);
+
   // Toggle online status
   const handleToggleOnline = async () => {
-    if (!puller) return;
+    if (!puller || isToggling) return;
+
+    const newStatus = !isOnline;
+    setIsToggling(true);
+    console.log(`🔄 Toggling status from ${isOnline} to ${newStatus}`);
+
+    // Update local state immediately for better UX (optimistic update)
+    setIsOnline(newStatus);
 
     try {
-      const updatedPuller = await apiService.updateOnlineStatus(
-        puller.id,
-        !isOnline
-      );
-      setPuller(updatedPuller);
-      setIsOnline(updatedPuller.isOnline);
+      // Update via WebSocket for real-time communication
+      await socketService.updateStatus(puller.id, newStatus);
+      console.log('✅ WebSocket status update sent');
       
-      // Publish status update to MQTT
-      mqttService.publishStatus(updatedPuller.isOnline, updatedPuller.isActive);
+      // Also update via HTTP API to ensure database consistency
+      try {
+        const updatedPuller = await apiService.updateOnlineStatus(puller.id, newStatus);
+        setPuller(updatedPuller);
+        console.log(`✅ HTTP status update completed, new status: ${updatedPuller.isOnline}`);
+      } catch (httpError) {
+        console.error('HTTP update failed, but WebSocket succeeded:', httpError);
+        // WebSocket update already succeeded, so we can continue
+      }
     } catch (error) {
-      console.error('Failed to update online status:', error);
+      console.error('Failed to update status:', error);
+      alert('Failed to update status. Please check your connection.');
+      // Revert the optimistic update
+      setIsOnline(!newStatus);
+    } finally {
+      setIsToggling(false);
     }
   };
 
@@ -54,15 +74,16 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ onViewHistory, onViewAva
         // Set offline before logout
         if (puller && isOnline) {
           await apiService.updateOnlineStatus(puller.id, false);
-          // Publish offline status to MQTT
-          mqttService.publishStatus(false, puller.isActive);
+          // Publish offline status via WebSocket
+          await socketService.updateStatus(puller.id, false)
+            .catch(err => console.error('Failed to update status:', err));
         }
       } catch (error) {
         console.error('Failed to set offline status:', error);
       }
       
-      // Disconnect MQTT
-      mqttService.disconnect();
+      // Disconnect WebSocket
+      socketService.disconnect();
       
       // Clear API token
       apiService.logout();
@@ -83,15 +104,17 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ onViewHistory, onViewAva
         <div className="flex items-center justify-between mb-2">
           <h2 className="text-2xl font-bold">{puller.name}</h2>
           
-          {/* Connection Indicator */}
+          {/* Connection Status Indicator */}
           <div className="flex items-center gap-2">
             <div
               className={`w-4 h-4 rounded-full ${
-                isConnected ? 'bg-primary' : 'bg-danger'
+                isConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'
               }`}
             />
-            <span className="text-sm text-gray-400">
-              {isConnected ? 'Connected' : 'Offline'}
+            <span className={`text-sm font-medium ${
+              isConnected ? 'text-green-400' : 'text-red-400'
+            }`}>
+              {isConnected ? 'Connected' : 'Disconnected'}
             </span>
           </div>
         </div>
@@ -152,16 +175,38 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ onViewHistory, onViewAva
 
         {/* Action Buttons */}
         <div className="w-full max-w-md space-y-4">
+          {/* Connection Warning */}
+          {!isConnected && (
+            <div className="bg-red-900 bg-opacity-30 border-2 border-red-500 rounded-xl p-4 text-center">
+              <p className="text-red-400 font-semibold">
+                ⚠️ Connection Lost
+              </p>
+              <p className="text-red-300 text-sm mt-1">
+                Reconnecting to server...
+              </p>
+            </div>
+          )}
+          
           {/* Toggle Online Button */}
           <button
             onClick={handleToggleOnline}
-            className={`w-full py-6 text-2xl font-bold rounded-xl active:scale-95 transition-transform ${
-              isOnline
-                ? 'bg-gray-800 text-white'
-                : 'bg-primary text-white'
+            disabled={isToggling || !isConnected}
+            className={`w-full py-6 text-2xl font-bold rounded-xl transition-all flex items-center justify-center gap-3 ${
+              isToggling || !isConnected
+                ? 'bg-gray-700 text-gray-500 cursor-not-allowed'
+                : isOnline
+                ? 'bg-gray-800 text-white active:scale-95'
+                : 'bg-primary text-white active:scale-95'
             }`}
           >
-            {isOnline ? 'Go Offline' : 'Go Online'}
+            {isToggling ? (
+              <>
+                <div className="w-6 h-6 border-4 border-gray-400 border-t-white rounded-full animate-spin" />
+                <span>{isOnline ? 'Going Offline...' : 'Going Online...'}</span>
+              </>
+            ) : (
+              <span>{isOnline ? 'Go Offline' : 'Go Online'}</span>
+            )}
           </button>
 
           {/* View History Button */}

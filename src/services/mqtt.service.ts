@@ -1,269 +1,110 @@
 import mqtt, { MqttClient } from 'mqtt';
-import { RideRequest, Ride } from '../types';
-import { getSecureUrl } from '../utils/protocol';
 
 /**
- * MqttService
- * Manages MQTT connection for puller app to receive ride requests and updates
- * 
- * Topics subscribed:
- * - aeras/pullers/{pullerId}/ride-request: New ride requests
- * - aeras/pullers/{pullerId}/ride-rejected: Ride rejection confirmations
- * - aeras/rides/+/filled: Ride filled notifications
- * - aeras/rides/+/status: Ride status updates
+ * MQTT Service for Puller App
+ * Subscribes to ride requests from the backend via MQTT broker
  */
+
+export type MqttRideRequestCallback = (request: any) => void;
 
 class MqttService {
   private client: MqttClient | null = null;
-  private pullerId: string | null = null;
-  private reconnectAttempts = 0;
-
-  // Event handlers
-  private onConnectCallback?: () => void;
-  private onDisconnectCallback?: () => void;
-  private onRideRequestCallback?: (request: RideRequest) => void;
-  private onRideFilledCallback?: (rideId: number) => void;
-  private onRideUpdateCallback?: (ride: Ride) => void;
-  private onNotificationCallback?: (notification: any) => void;
+  private onRideRequestCallback: MqttRideRequestCallback | null = null;
+  private isConnected = false;
 
   /**
-   * Connect to MQTT broker and subscribe to puller-specific topics
+   * Connect to MQTT broker and subscribe to ride requests
    */
-  connect(pullerId: string, onConnect?: () => void, onDisconnect?: () => void): void {
-    this.pullerId = pullerId;
-    this.onConnectCallback = onConnect;
-    this.onDisconnectCallback = onDisconnect;
+  connect(pullerId: number): void {
 
-    // Use WebSocket protocol for browser MQTT connection
-    const brokerUrl = getSecureUrl(import.meta.env.VITE_MQTT_BROKER_URL || 'ws://broker.hivemq.com:8000/mqtt');
+    if (this.client && this.isConnected) {
+      console.log('MQTT already connected');
+      return;
+    }
 
-    console.log('📡 MQTT Configuration:');
-    console.log('   Broker URL:', brokerUrl);
-    console.log('   Puller ID:', pullerId);
+    // Browser environment requires WebSocket protocol (ws:// or wss://)
+    // HiveMQ public broker WebSocket port: 8000 (ws), 8884 (wss)
+    let brokerUrl = import.meta.env.VITE_MQTT_BROKER || 'ws://broker.hivemq.com:8000/mqtt';
+    
+    // Auto-switch to wss:// if running on HTTPS
+    if (window.location.protocol === 'https:' && brokerUrl.startsWith('ws://')) {
+      brokerUrl = brokerUrl.replace('ws://', 'wss://').replace(':8000', ':8884');
+      console.log('🔒 Running on HTTPS, switching to secure WebSocket');
+    }
+    
+    console.log('🔌 Connecting to MQTT broker:', brokerUrl);
 
-    // Connect to MQTT broker via WebSocket
-    this.client = mqtt.connect(brokerUrl, {
-      clientId: `puller_${pullerId}_${Math.random().toString(16).substr(2, 8)}`,
-      clean: true,
-      reconnectPeriod: 2000,
-      connectTimeout: 30000,
-    });
+    try {
+      this.client = mqtt.connect(brokerUrl, {
+        clientId: `puller_${pullerId}_${Date.now()}`,
+        clean: true,
+        reconnectPeriod: 1000,
+        connectTimeout: 30000,
+      });
 
-    this.setupEventListeners();
-  }
+      this.client.on('connect', () => {
+        console.log('✅ MQTT connected');
+        this.isConnected = true;
 
-  /**
-   * Setup MQTT event listeners
-   */
-  private setupEventListeners(): void {
-    if (!this.client) return;
-
-    // Connection established
-    this.client.on('connect', () => {
-      console.log('✅ MQTT connected successfully');
-      console.log('   Client ID:', this.client?.options.clientId);
-      this.reconnectAttempts = 0;
-
-      // Subscribe to puller-specific topics
-      if (this.pullerId) {
-        const topics = [
-          `aeras/pullers/${this.pullerId}/ride-request`,
-          `aeras/pullers/${this.pullerId}/ride-rejected`,
-          `aeras/rides/+/filled`,
-          `aeras/rides/+/status`,
-        ];
-
-        console.log('🔄 Attempting to subscribe to topics:', topics);
-
-        this.client?.subscribe(topics, { qos: 1 }, (err, granted) => {
+        // Subscribe to ride requests for this specific puller
+        const topic = `aeras/ride-request`;
+        this.client?.subscribe(topic, (err) => {
           if (err) {
-            console.error('❌ Failed to subscribe to topics:', err);
+            console.error('❌ Failed to subscribe to ride requests:', err);
           } else {
-            console.log('✅ Subscribed to topics successfully!');
-            console.log('   Granted subscriptions:', granted);
+            console.log(`✅ Subscribed to: ${topic}`);
           }
         });
-      }
-
-      this.onConnectCallback?.();
-    });
-
-    // Connection lost
-    this.client.on('disconnect', () => {
-      console.log('❌ MQTT disconnected');
-      this.onDisconnectCallback?.();
-    });
-
-    // Offline
-    this.client.on('offline', () => {
-      console.log('📴 MQTT client is offline');
-      this.onDisconnectCallback?.();
-    });
-
-    // Reconnecting
-    this.client.on('reconnect', () => {
-      this.reconnectAttempts++;
-      console.log(`🔄 Reconnecting to MQTT... Attempt ${this.reconnectAttempts}`);
-    });
-
-    // Error
-    this.client.on('error', (error) => {
-      console.error('❌ MQTT error:', error);
-    });
-
-    // Message received
-    this.client.on('message', (topic, payload) => {
-      try {
-        const message = JSON.parse(payload.toString());
-        console.log('📨 MQTT message received:', { topic, message });
-
-        this.handleMessage(topic, message);
-      } catch (error) {
-        console.error('❌ Error parsing MQTT message:', error);
-      }
-    });
-  }
-
-  /**
-   * Handle incoming MQTT messages based on topic
-   */
-  private handleMessage(topic: string, message: any): void {
-    console.log('🔍 Handling message for topic:', topic);
-    console.log('🔍 Message content:', message);
-    console.log('🔍 Current puller ID:', this.pullerId);
-    
-    // New ride request for this puller
-    if (topic === `aeras/pullers/${this.pullerId}/ride-request`) {
-      console.log('🔔 New ride request received:', {
-        rideId: message.rideId,
-        pickup: message.pickupBlock?.name,
-        destination: message.destinationBlock?.name,
-        points: message.estimatedPoints,
       });
-      
-      // Transform to match RideRequest interface
-      const rideRequest: RideRequest = {
-        id: message.rideId,
-        pickupBlock: message.pickupBlock,
-        destinationBlock: message.destinationBlock,
-        pickupLat: message.pickupBlock?.centerLat,
-        pickupLon: message.pickupBlock?.centerLon,
-        estimatedPoints: message.estimatedPoints,
-        expiresAt: message.expiresAt, // Keep as string
-      };
-      
-      this.onRideRequestCallback?.(rideRequest);
-    }
 
-    // Ride rejection confirmation
-    else if (topic === `aeras/pullers/${this.pullerId}/ride-rejected`) {
-      console.log('✅ Ride rejection confirmed:', message.rideId);
-      this.onNotificationCallback?.({
-        type: 'ride_rejected',
-        message: message.message,
-        rideId: message.rideId,
+      this.client.on('message', (topic, message) => {
+        console.log(`📨 MQTT message received on topic: ${topic}`);
+        
+        try {
+          const data = JSON.parse(message.toString());
+          console.log('📦 MQTT payload:', data);
+
+          // Check if this is a ride request
+          if (topic.includes('ride-request')) {
+            console.log('🔔 Ride request received via MQTT:', data);
+            console.log('🔔 Callback registered?', this.onRideRequestCallback !== null);
+            
+            if (this.onRideRequestCallback) {
+              console.log('✅ Calling ride request callback...');
+              this.onRideRequestCallback(data);
+              console.log('✅ Callback called successfully');
+            } else {
+              console.error('❌ No callback registered for ride requests!');
+            }
+          }
+        } catch (error) {
+          console.error('❌ Error parsing MQTT message:', error);
+        }
       });
-    }
 
-    // Ride filled by another puller
-    else if (topic.startsWith('aeras/rides/') && topic.endsWith('/filled')) {
-      console.log('🚫 Ride filled by another puller:', message.rideId);
-      this.onRideFilledCallback?.(message.rideId);
-    }
-
-    // Ride status update
-    else if (topic.startsWith('aeras/rides/') && topic.endsWith('/status')) {
-      console.log('📝 Ride status update:', {
-        rideId: message.rideId,
-        status: message.status,
+      this.client.on('error', (error) => {
+        console.error('❌ MQTT error:', error);
+        this.isConnected = false;
       });
-      this.onRideUpdateCallback?.(message);
+
+      this.client.on('close', () => {
+        console.log('❌ MQTT connection closed');
+        this.isConnected = false;
+      });
+
+      this.client.on('reconnect', () => {
+        console.log('🔄 MQTT reconnecting...');
+      });
+
+      this.client.on('offline', () => {
+        console.log('⚠️ MQTT offline');
+        this.isConnected = false;
+      });
+
+    } catch (error) {
+      console.error('❌ MQTT connection error:', error);
+      this.isConnected = false;
     }
-    
-    else {
-      console.log('⚠️ Unhandled topic:', topic);
-    }
-  }
-
-  /**
-   * Publish puller location update to MQTT
-   */
-  publishLocation(latitude: number, longitude: number, additionalData?: any): void {
-    if (!this.client || !this.pullerId) {
-      console.warn('Cannot publish location: MQTT not connected');
-      return;
-    }
-
-    const topic = `aeras/pullers/${this.pullerId}/location`;
-    const payload = {
-      pullerId: this.pullerId,
-      latitude,
-      longitude,
-      timestamp: new Date().toISOString(),
-      ...additionalData,
-    };
-
-    this.client.publish(topic, JSON.stringify(payload), { qos: 1 }, (err) => {
-      if (err) {
-        console.error('❌ Failed to publish location:', err);
-      } else {
-        console.log('📍 Published location update to MQTT');
-      }
-    });
-  }
-
-  /**
-   * Publish puller status update to MQTT
-   */
-  publishStatus(isOnline: boolean, isActive: boolean): void {
-    if (!this.client || !this.pullerId) {
-      console.warn('Cannot publish status: MQTT not connected');
-      return;
-    }
-
-    const topic = `aeras/pullers/${this.pullerId}/status`;
-    const payload = {
-      pullerId: this.pullerId,
-      isOnline,
-      isActive,
-      timestamp: new Date().toISOString(),
-    };
-
-    this.client.publish(topic, JSON.stringify(payload), { qos: 1 }, (err) => {
-      if (err) {
-        console.error('❌ Failed to publish status:', err);
-      } else {
-        console.log('🔄 Published status update to MQTT');
-      }
-    });
-  }
-
-  /**
-   * Register callback for new ride requests
-   */
-  onRideRequest(callback: (request: RideRequest) => void): void {
-    this.onRideRequestCallback = callback;
-  }
-
-  /**
-   * Register callback for ride filled events
-   */
-  onRideFilled(callback: (rideId: number) => void): void {
-    this.onRideFilledCallback = callback;
-  }
-
-  /**
-   * Register callback for ride updates
-   */
-  onRideUpdate(callback: (ride: Ride) => void): void {
-    this.onRideUpdateCallback = callback;
-  }
-
-  /**
-   * Register callback for general notifications
-   */
-  onNotification(callback: (notification: any) => void): void {
-    this.onNotificationCallback = callback;
   }
 
   /**
@@ -271,18 +112,27 @@ class MqttService {
    */
   disconnect(): void {
     if (this.client) {
-      console.log('Disconnecting from MQTT...');
-      this.client.end(true);
+      console.log('🔌 Disconnecting from MQTT broker...');
+      this.client.end();
       this.client = null;
-      this.pullerId = null;
+      this.isConnected = false;
     }
   }
 
   /**
-   * Check if MQTT client is connected
+   * Set callback for ride request events
    */
-  isConnected(): boolean {
-    return this.client?.connected ?? false;
+  onRideRequest(callback: MqttRideRequestCallback): void {
+    console.log('📝 Registering MQTT ride request callback');
+    this.onRideRequestCallback = callback;
+    console.log('✅ MQTT ride request callback registered');
+  }
+
+  /**
+   * Check if MQTT is connected
+   */
+  isClientConnected(): boolean {
+    return this.isConnected && this.client?.connected === true;
   }
 }
 

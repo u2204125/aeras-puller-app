@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useAppStore } from './store/appStore';
 import { apiService } from './services/api.service';
+import { socketService } from './services/socket.service';
 import { mqttService } from './services/mqtt.service';
 import { getCurrentPosition, watchPosition, clearWatch } from './utils/geolocation';
 import { LoginScreen } from './components/LoginScreen';
@@ -36,7 +37,6 @@ function App() {
   const setPuller = useAppStore((state) => state.setPuller);
   const setCurrentRide = useAppStore((state) => state.setCurrentRide);
   const setPendingRequest = useAppStore((state) => state.setPendingRequest);
-  const setIsConnected = useAppStore((state) => state.setIsConnected);
   const setUserLocation = useAppStore((state) => state.setUserLocation);
   const setShowRideCompleteModal = useAppStore((state) => state.setShowRideCompleteModal);
   const setLastCompletedRide = useAppStore((state) => state.setLastCompletedRide);
@@ -69,8 +69,9 @@ function App() {
       getCurrentPosition()
         .then((location) => {
           setUserLocation(location);
-          // Publish location to MQTT (backend will update DB)
-          mqttService.publishLocation(location.latitude, location.longitude);
+          // Publish location to backend via WebSocket
+          socketService.updateLocation(puller.id, location.latitude, location.longitude)
+            .catch(err => console.error('Failed to update location:', err));
         })
         .catch((error) => {
           console.error('Failed to get location:', error);
@@ -78,15 +79,17 @@ function App() {
           const mockLocation = { latitude: 23.8103, longitude: 90.4125 };
           console.log('📍 Using mock location for demo:', mockLocation);
           setUserLocation(mockLocation);
-          mqttService.publishLocation(mockLocation.latitude, mockLocation.longitude);
+          socketService.updateLocation(puller.id, mockLocation.latitude, mockLocation.longitude)
+            .catch(err => console.error('Failed to update location:', err));
         });
 
       // Watch position changes (with fallback)
       const id = watchPosition(
         (location) => {
           setUserLocation(location);
-          // Publish location to MQTT every update (backend listens and updates DB)
-          mqttService.publishLocation(location.latitude, location.longitude);
+          // Publish location to backend via WebSocket every update
+          socketService.updateLocation(puller.id, location.latitude, location.longitude)
+            .catch(err => console.error('Failed to update location:', err));
         },
         (error) => {
           console.error('Location watch error:', error);
@@ -141,40 +144,72 @@ function App() {
   }, [puller?.id]);
 
   /**
-   * Setup MQTT event handlers (only once)
+   * Setup MQTT and WebSocket event handlers (only once)
    */
   useEffect(() => {
-    // Setup MQTT event handlers
-    mqttService.onRideRequest((request) => {
-      console.log('🔔 New ride request received via MQTT:', request);
+    console.log('🔧 Setting up event handlers...');
+    
+    // MQTT: Handle ride requests from broker
+    const handleMqttRideRequest = (request: any) => {
+      console.log('🔔 NEW RIDE REQUEST RECEIVED via MQTT:', request);
+      console.log('📦 MQTT Request payload:', JSON.stringify(request, null, 2));
+      
+      // Hardware payload has: blockId, destinationId, timestamp, priority
+      // Transform to match RideRequest interface
+      const rideRequest = {
+        id: Date.now(), // Generate temporary ID
+        pickupBlock: {
+          blockId: request.blockId,
+          name: request.blockId, // Use blockId as name for now
+          centerLat: 0, // Will be set by backend
+          centerLon: 0, // Will be set by backend
+        },
+        destinationBlock: {
+          blockId: request.destinationId,
+          name: request.destinationId, // Use destinationId as name for now
+          centerLat: 0, // Will be set by backend
+          centerLon: 0, // Will be set by backend
+        },
+        pickupLat: 0, // Will be set by backend
+        pickupLon: 0, // Will be set by backend
+        estimatedPoints: 100, // Default points
+        expiresAt: new Date(Date.now() + 1 * 60 * 1000).toISOString(), // 1 minute from now
+      };
+      
+      console.log('✅ Transformed ride request:', rideRequest);
       
       // Show notification with audio and vibration
       notificationManager.showRideRequestNotification({
-        rideId: request.id,
-        from: request.pickupBlock.name,
-        to: request.destinationBlock.name,
-        points: request.estimatedPoints,
+        rideId: rideRequest.id,
+        from: request.blockId,
+        to: request.destinationId,
+        points: rideRequest.estimatedPoints,
       });
       
-      // Add to available rides
-      useAppStore.getState().addAvailableRide(request);
-      // Set as pending request to show modal
-      useAppStore.getState().setPendingRequest(request);
-    });
+      // Add to available rides (don't auto-show modal)
+      useAppStore.getState().addAvailableRide(rideRequest);
+      
+      console.log('✅ Ride request added to available rides');
+    };
 
-    mqttService.onRideFilled((rideId) => {
-      console.log('🚫 Ride filled:', rideId);
+    // Setup MQTT ride request handler
+    mqttService.onRideRequest(handleMqttRideRequest);
+
+    // WebSocket: Handle ride filled notifications
+    const handleRideFilled = (data: { rideId: number }) => {
+      console.log('🚫 Ride filled:', data.rideId);
       // Remove from available rides
-      useAppStore.getState().removeAvailableRide(rideId);
+      useAppStore.getState().removeAvailableRide(data.rideId);
       // Get current state and only clear if it matches
       const current = useAppStore.getState().pendingRequest;
-      if (current && current.id === rideId) {
+      if (current && current.id === data.rideId) {
         useAppStore.getState().setPendingRequest(null);
       }
-    });
+    };
 
-    mqttService.onRideUpdate((ride) => {
-      console.log('📝 Ride update received via MQTT:', ride);
+    // WebSocket: Handle ride updates
+    const handleRideUpdate = (ride: any) => {
+      console.log('📝 Ride update received via WebSocket:', ride);
       
       // If ride status changed to ACCEPTED or not SEARCHING, remove from available
       if (ride.status !== 'SEARCHING') {
@@ -186,38 +221,74 @@ function App() {
       if (current && current.id === ride.id) {
         useAppStore.getState().setCurrentRide(ride);
       }
-    });
+    };
 
-    mqttService.onNotification((notification) => {
-      console.log('📬 Notification received via MQTT:', notification);
+    // WebSocket: Handle notifications
+    const handleNotification = (notification: any) => {
+      console.log('📬 Notification received via WebSocket:', notification);
       // Handle specific notification types
       if (notification.type === 'ride_rejected') {
         console.log('Ride rejection confirmed by server');
       }
-    });
+    };
+
+    // Register WebSocket event handlers (NOT for ride requests)
+    socketService.onRideFilled(handleRideFilled);
+    socketService.onRideUpdate(handleRideUpdate);
+    socketService.onNotification(handleNotification);
+
+    // Cleanup: remove event listeners on unmount
+    return () => {
+      socketService.offRideFilled(handleRideFilled);
+      socketService.offRideUpdate(handleRideUpdate);
+      socketService.offNotification(handleNotification);
+    };
   }, []); // Run only once on mount
 
   /**
-   * Connect/disconnect MQTT when puller changes
+   * Auto-remove expired ride requests (1 minute expiration)
+   */
+  useEffect(() => {
+    const checkExpiredRides = () => {
+      const now = new Date();
+      const availableRides = useAppStore.getState().availableRides;
+      
+      availableRides.forEach((ride) => {
+        const expiresAt = new Date(ride.expiresAt);
+        if (now >= expiresAt) {
+          console.log(`⏰ Ride ${ride.id} has expired, removing...`);
+          useAppStore.getState().removeAvailableRide(ride.id);
+          
+          // If this was the pending request, clear it
+          const pendingRequest = useAppStore.getState().pendingRequest;
+          if (pendingRequest && pendingRequest.id === ride.id) {
+            useAppStore.getState().setPendingRequest(null);
+          }
+        }
+      });
+    };
+
+    // Check every second for expired rides
+    const interval = setInterval(checkExpiredRides, 1000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  /**
+   * Connect/disconnect WebSocket and MQTT when puller changes
    */
   useEffect(() => {
     if (puller) {
+      console.log('🔌 Connecting WebSocket for puller:', puller.id);
+      socketService.connect(puller.id);
+
       console.log('🔌 Connecting MQTT for puller:', puller.id);
-      
-      // Connect to MQTT - callbacks are already registered
-      mqttService.connect(
-        puller.id.toString(),
-        () => {
-          console.log('✅ MQTT connected, puller subscribed to topics');
-          setIsConnected(true);
-        },
-        () => {
-          console.log('❌ MQTT disconnected');
-          setIsConnected(false);
-        }
-      );
+      mqttService.connect(puller.id);
 
       return () => {
+        console.log('🔌 Disconnecting WebSocket for puller:', puller.id);
+        socketService.disconnect();
+        
         console.log('🔌 Disconnecting MQTT for puller:', puller.id);
         mqttService.disconnect();
       };
@@ -230,18 +301,49 @@ function App() {
   const handleAcceptRideFromModal = async (rideId: number) => {
     if (!puller) return;
 
+    console.log(`✅ Accepting ride ${rideId} for puller ${puller.id}`);
     setIsLoading(true);
+    
     try {
-      const acceptedRide = await apiService.acceptRide(rideId, puller.id);
+      // Find the ride request to get its details
+      const rideRequest = availableRides.find(r => r.id === rideId);
+      if (!rideRequest) {
+        throw new Error('Ride not found');
+      }
+      
+      // For MQTT-only mode: Create a mock accepted ride
+      const acceptedRide = {
+        id: rideId,
+        status: RideStatus.ACCEPTED,
+        requestTime: new Date().toISOString(),
+        acceptTime: new Date().toISOString(),
+        pickupTime: null,
+        completionTime: null,
+        pointsAwarded: null,
+        pickupBlock: rideRequest.pickupBlock,
+        destinationBlock: rideRequest.destinationBlock,
+        puller: puller,
+        pickupLat: rideRequest.pickupLat,
+        pickupLon: rideRequest.pickupLon,
+        destinationLat: rideRequest.destinationBlock.centerLat,
+        destinationLon: rideRequest.destinationBlock.centerLon,
+        finalLat: null,
+        finalLon: null,
+      };
+      
+      console.log('✅ Ride accepted successfully (MQTT mode):', acceptedRide);
+      
       setCurrentRide(acceptedRide);
       removeAvailableRide(rideId);
       setShowAvailableRidesModal(false);
       
       // Show acceptance notification
       notificationManager.showRideAcceptedNotification(acceptedRide.id);
+      
+      console.log('🗺️ Navigating to pickup screen...');
     } catch (error: any) {
-      console.error('Failed to accept ride:', error);
-      alert(error.response?.data?.message || 'Failed to accept ride. It may have been filled.');
+      console.error('❌ Failed to accept ride:', error);
+      alert('Failed to accept ride. Please try again.');
       removeAvailableRide(rideId);
     } finally {
       setIsLoading(false);
@@ -254,13 +356,11 @@ function App() {
   const handleRejectRideFromModal = async (rideId: number) => {
     if (!puller) return;
 
-    try {
-      await apiService.rejectRide(rideId, puller.id);
-      removeAvailableRide(rideId);
-    } catch (error) {
-      console.error('Failed to reject ride:', error);
-      removeAvailableRide(rideId);
-    }
+    console.log(`❌ Rejecting ride ${rideId} for puller ${puller.id}`);
+    
+    // For MQTT-only mode: Just remove from list
+    removeAvailableRide(rideId);
+    console.log('✅ Ride rejected successfully (MQTT mode)');
   };
 
   /**
@@ -269,21 +369,45 @@ function App() {
   const handleAcceptRide = async () => {
     if (!pendingRequest || !puller) return;
 
+    console.log(`✅ Accepting pending ride ${pendingRequest.id} for puller ${puller.id}`);
     setIsLoading(true);
+    
     try {
-      const acceptedRide = await apiService.acceptRide(
-        pendingRequest.id,
-        puller.id
-      );
+      // For MQTT-only mode: Create a mock accepted ride
+      const acceptedRide = {
+        id: pendingRequest.id,
+        status: RideStatus.ACCEPTED,
+        requestTime: new Date().toISOString(),
+        acceptTime: new Date().toISOString(),
+        pickupTime: null,
+        completionTime: null,
+        pointsAwarded: null,
+        pickupBlock: pendingRequest.pickupBlock,
+        destinationBlock: pendingRequest.destinationBlock,
+        puller: puller,
+        pickupLat: pendingRequest.pickupLat,
+        pickupLon: pendingRequest.pickupLon,
+        destinationLat: pendingRequest.destinationBlock.centerLat,
+        destinationLon: pendingRequest.destinationBlock.centerLon,
+        finalLat: null,
+        finalLon: null,
+      };
+      
+      console.log('✅ Ride accepted successfully (MQTT mode):', acceptedRide);
+      
       setCurrentRide(acceptedRide);
       setPendingRequest(null);
+      removeAvailableRide(pendingRequest.id);
       
       // Show acceptance notification
       notificationManager.showRideAcceptedNotification(acceptedRide.id);
+      
+      console.log('🗺️ Navigating to pickup screen...');
     } catch (error: any) {
-      console.error('Failed to accept ride:', error);
-      alert(error.response?.data?.message || 'Failed to accept ride. It may have been filled.');
+      console.error('❌ Failed to accept ride:', error);
+      alert('Failed to accept ride. Please try again.');
       setPendingRequest(null);
+      removeAvailableRide(pendingRequest.id);
     } finally {
       setIsLoading(false);
     }
@@ -295,13 +419,12 @@ function App() {
   const handleRejectRide = async () => {
     if (!pendingRequest || !puller) return;
 
-    try {
-      await apiService.rejectRide(pendingRequest.id, puller.id);
-    } catch (error) {
-      console.error('Failed to reject ride:', error);
-    } finally {
-      setPendingRequest(null);
-    }
+    console.log(`❌ Rejecting pending ride ${pendingRequest.id} for puller ${puller.id}`);
+    
+    // For MQTT-only mode: Just clear pending and remove from list
+    setPendingRequest(null);
+    removeAvailableRide(pendingRequest.id);
+    console.log('✅ Ride rejected successfully (MQTT mode)');
   };
 
   /**
@@ -317,12 +440,24 @@ function App() {
   const handleConfirmPickup = async () => {
     if (!currentRide) return;
 
+    console.log('📍 Confirming pickup for ride:', currentRide.id);
     setIsLoading(true);
+    
     try {
-      const updatedRide = await apiService.confirmPickup(currentRide.id);
+      // For MQTT-only mode: Update ride status to ACTIVE
+      const updatedRide = {
+        ...currentRide,
+        status: RideStatus.ACTIVE,
+        pickupTime: new Date().toISOString(),
+        // Update map markers: Now navigate to destination instead of pickup
+        pickupLat: currentRide.destinationLat || 23.8103, // Use destination as new target
+        pickupLon: currentRide.destinationLon || 90.4125,
+      };
+      
+      console.log('✅ Pickup confirmed (MQTT mode), now heading to destination');
       setCurrentRide(updatedRide);
     } catch (error) {
-      console.error('Failed to confirm pickup:', error);
+      console.error('❌ Failed to confirm pickup:', error);
       alert('Failed to confirm pickup. Please try again.');
     } finally {
       setIsLoading(false);
@@ -335,45 +470,57 @@ function App() {
   const handleCompleteRide = async () => {
     if (!currentRide || !puller) return;
 
+    console.log('🏁 Completing ride:', currentRide.id);
     setIsLoading(true);
+    
     try {
-      // For demo purposes, use destination coordinates or fallback coordinates
-      // In production, this would use actual GPS: await getCurrentPosition()
+      // Use fallback coordinates for completion
       const mockLat = currentRide.destinationLat || 23.8103;
       const mockLon = currentRide.destinationLon || 90.4125;
       
       console.log(`🎯 Completing ride with coordinates: ${mockLat}, ${mockLon}`);
       
-      // Complete the ride
-      const completedRide = await apiService.completeRide(
-        currentRide.id,
-        mockLat,
-        mockLon
-      );
-
-      // Update puller points
-      if (completedRide.pointsAwarded) {
-        const newBalance = puller.pointsBalance + completedRide.pointsAwarded;
-        updatePullerPoints(newBalance);
-        
-        // Update the completed ride with new balance
-        completedRide.puller = { ...puller, pointsBalance: newBalance };
-        
-        // Show completion notification
-        notificationManager.showRideCompletedNotification(completedRide.pointsAwarded);
+      // Calculate points (mock calculation)
+      const pointsAwarded = currentRide.pickupBlock?.name && currentRide.destinationBlock?.name 
+        ? 100 
+        : 50;
+      
+      console.log(`💰 Points awarded: ${pointsAwarded}`);
+      
+      // Update puller points via API
+      try {
+        const newBalance = puller.pointsBalance + pointsAwarded;
+        const updatedPuller = await apiService.updatePullerPoints(puller.id, newBalance);
+        setPuller(updatedPuller);
+        console.log(`✅ Puller points updated: ${puller.pointsBalance} → ${newBalance}`);
+      } catch (apiError) {
+        console.error('❌ Failed to update points via API:', apiError);
+        // Update locally even if API fails
+        updatePullerPoints(puller.pointsBalance + pointsAwarded);
       }
-
+      
+      // Create completed ride for modal
+      const completedRide = {
+        ...currentRide,
+        status: RideStatus.COMPLETED,
+        completionTime: new Date().toISOString(),
+        pointsAwarded: pointsAwarded,
+        finalLat: mockLat,
+        finalLon: mockLon,
+        puller: { ...puller, pointsBalance: puller.pointsBalance + pointsAwarded },
+      };
+      
+      // Show completion notification
+      notificationManager.showRideCompletedNotification(pointsAwarded);
+      
       // Show completion modal
       setLastCompletedRide(completedRide);
       setShowRideCompleteModal(true);
       setCurrentRide(null);
-
-      // Refresh puller data from server
-      const updatedPuller = await apiService.getPuller(puller.id);
-      setPuller(updatedPuller);
       
+      console.log('✅ Ride completed successfully');
     } catch (error) {
-      console.error('Failed to complete ride:', error);
+      console.error('❌ Failed to complete ride:', error);
       alert('Failed to complete ride. Please try again.');
     } finally {
       setIsLoading(false);
