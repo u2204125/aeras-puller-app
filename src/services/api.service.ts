@@ -1,9 +1,11 @@
 import axios, { AxiosInstance } from 'axios';
 import { Puller, Ride } from '../types';
+import { socketService } from './socket.service';
 
 /**
  * API Service
- * Handles all HTTP requests to the backend
+ * Handles HTTP requests for login and data fetching
+ * Uses WebSocket (via socketService) for all actions after login
  * Base URL is configured via environment variable
  */
 
@@ -88,6 +90,7 @@ class ApiService {
 
   /**
    * Puller Authentication using phone number
+   * After successful login, connects to WebSocket and publishes data to MQTT
    */
   async loginPuller(phone: string): Promise<Puller> {
     try {
@@ -102,7 +105,18 @@ class ApiService {
         localStorage.setItem('puller_token', response.data.access_token);
       }
 
-      return response.data.puller;
+      const puller = response.data.puller;
+
+      // Connect to WebSocket after successful login
+      try {
+        await socketService.connect(puller.id);
+        console.log('✅ Connected to WebSocket - All actions will use real-time communication');
+      } catch (wsError) {
+        console.warn('⚠️  WebSocket connection failed, will fallback to HTTP:', wsError);
+      }
+
+      // Backend already published puller data to MQTT on login
+      return puller;
     } catch (error: any) {
       console.error('Login error:', error);
       if (error.response?.status === 404) {
@@ -124,59 +138,97 @@ class ApiService {
 
   /**
    * Update puller's online status
+   * Uses WebSocket for real-time updates
    */
   async updateOnlineStatus(pullerId: number, isOnline: boolean): Promise<Puller> {
-    const endpoint = isOnline ? 'online' : 'offline';
-    const response = await this.api.post<Puller>(`/pullers/${pullerId}/${endpoint}`);
-    return response.data;
+    // Use WebSocket if connected, otherwise fallback to HTTP
+    if (socketService.isConnected()) {
+      await socketService.updateStatus(pullerId, isOnline);
+      // Fetch updated puller data
+      return this.getPuller(pullerId);
+    } else {
+      const endpoint = isOnline ? 'online' : 'offline';
+      const response = await this.api.post<Puller>(`/pullers/${pullerId}/${endpoint}`);
+      return response.data;
+    }
   }
 
   /**
    * Update puller's GPS location
+   * Uses WebSocket for real-time updates
    */
   async updateLocation(pullerId: number, lat: number, lon: number): Promise<void> {
-    await this.api.post(`/pullers/${pullerId}/location`, {
-      lat,
-      lon,
-    });
+    // Use WebSocket if connected, otherwise fallback to HTTP
+    if (socketService.isConnected()) {
+      await socketService.updateLocation(pullerId, lat, lon);
+    } else {
+      await this.api.post(`/pullers/${pullerId}/location`, {
+        lat,
+        lon,
+      });
+    }
   }
 
   /**
    * Accept a ride request
+   * Uses WebSocket for real-time updates
    */
   async acceptRide(rideId: number, pullerId: number): Promise<Ride> {
-    const response = await this.api.post<any>(`/rides/${rideId}/accept`, {
-      pullerId: pullerId.toString(),
-    });
-    return transformRide(response.data);
+    // Use WebSocket if connected, otherwise fallback to HTTP
+    if (socketService.isConnected()) {
+      return await socketService.acceptRide(rideId, pullerId);
+    } else {
+      const response = await this.api.post<any>(`/rides/${rideId}/accept`, {
+        pullerId: pullerId.toString(),
+      });
+      return transformRide(response.data);
+    }
   }
 
   /**
    * Reject a ride request
+   * Uses WebSocket for real-time updates
    */
   async rejectRide(rideId: number, pullerId: number): Promise<void> {
-    await this.api.post(`/rides/${rideId}/reject`, {
-      pullerId: pullerId.toString(),
-    });
+    // Use WebSocket if connected, otherwise fallback to HTTP
+    if (socketService.isConnected()) {
+      await socketService.rejectRide(rideId, pullerId);
+    } else {
+      await this.api.post(`/rides/${rideId}/reject`, {
+        pullerId: pullerId.toString(),
+      });
+    }
   }
 
   /**
    * Confirm pickup (puller has arrived at pickup location)
+   * Uses WebSocket for real-time updates
    */
   async confirmPickup(rideId: number): Promise<Ride> {
-    const response = await this.api.post<any>(`/rides/${rideId}/pickup`);
-    return transformRide(response.data);
+    // Use WebSocket if connected, otherwise fallback to HTTP
+    if (socketService.isConnected()) {
+      return await socketService.confirmPickup(rideId);
+    } else {
+      const response = await this.api.post<any>(`/rides/${rideId}/pickup`);
+      return transformRide(response.data);
+    }
   }
 
   /**
    * Complete a ride
+   * Uses WebSocket for real-time updates
    */
   async completeRide(rideId: number, finalLat: number, finalLon: number): Promise<Ride> {
-    const response = await this.api.post<any>(`/rides/${rideId}/complete`, {
-      finalLat,
-      finalLon,
-    });
-    return transformRide(response.data);
+    // Use WebSocket if connected, otherwise fallback to HTTP
+    if (socketService.isConnected()) {
+      return await socketService.completeRide(rideId, finalLat, finalLon);
+    } else {
+      const response = await this.api.post<any>(`/rides/${rideId}/complete`, {
+        finalLat,
+        finalLon,
+      });
+      return transformRide(response.data);
+    }
   }
 
   /**
