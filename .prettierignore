@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+dev-dist/
+
+# Cache
+.cache/
+.vite/
+.turbo/
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PWA
+sw.js
+workbox-*.js
+
+# Misc
+coverage/
+*.min.js
+*.min.css
