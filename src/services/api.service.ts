@@ -1,6 +1,7 @@
 import axios, { AxiosInstance } from 'axios';
 import { Puller, Ride } from '../types';
 import { socketService } from './socket.service';
+import { getSecureUrl } from '../utils/protocol';
 
 /**
  * API Service
@@ -28,7 +29,7 @@ class ApiService {
   private api: AxiosInstance;
 
   constructor() {
-    const baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000/api/v1';
+    const baseURL = getSecureUrl(import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000/api/v1');
     
     console.log('🔧 API Service Configuration:');
     console.log('   Base URL:', baseURL);

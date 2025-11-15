@@ -1,5 +1,6 @@
 import { io, Socket } from 'socket.io-client';
 import { Ride } from '../types';
+import { getSecureUrl } from '../utils/protocol';
 
 /**
  * WebSocket Service
@@ -19,7 +20,7 @@ class SocketService {
    */
   connect(pullerId: number): Promise<void> {
     return new Promise((resolve, reject) => {
-      const wsUrl = import.meta.env.VITE_WS_URL || 'http://localhost:3000';
+      const wsUrl = getSecureUrl(import.meta.env.VITE_SOCKET_URL || 'http://localhost:3000');
       
       console.log('🔌 Connecting to WebSocket:', wsUrl);
       

@@ -1,5 +1,6 @@
 import mqtt, { MqttClient } from 'mqtt';
 import { RideRequest, Ride } from '../types';
+import { getSecureUrl } from '../utils/protocol';
 
 /**
  * MqttService
@@ -34,7 +35,7 @@ class MqttService {
     this.onDisconnectCallback = onDisconnect;
 
     // Use WebSocket protocol for browser MQTT connection
-    const brokerUrl = import.meta.env.VITE_MQTT_BROKER_URL || 'ws://broker.hivemq.com:8000/mqtt';
+    const brokerUrl = getSecureUrl(import.meta.env.VITE_MQTT_BROKER_URL || 'ws://broker.hivemq.com:8000/mqtt');
 
     console.log('📡 MQTT Configuration:');
     console.log('   Broker URL:', brokerUrl);
