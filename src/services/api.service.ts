@@ -15,14 +15,36 @@ import { getSecureUrl } from '../utils/protocol';
  * Backend uses startBlock, frontend uses pickupBlock
  */
 function transformRide(backendRide: any): Ride {
+  // Normalize pickup/destination blocks returned by backend
+  const rawPickup = backendRide.startBlock || backendRide.pickupBlock || {};
+  const rawDestination = backendRide.destinationBlock || backendRide.dropOffBlock || backendRide.destinationBlock || {};
+
+  const pickupBlock = {
+    blockId: rawPickup.blockId || rawPickup.id || '',
+    // backend sometimes uses `destinationName` or `name` or `destination_name`
+    name: rawPickup.destinationName || rawPickup.name || rawPickup.destination_name || rawPickup.label || 'Unknown',
+    centerLat: rawPickup.centerLat ?? rawPickup.latitude ?? rawPickup.lat ?? 0,
+    centerLon: rawPickup.centerLon ?? rawPickup.longitude ?? rawPickup.lon ?? 0,
+    ...rawPickup,
+  };
+
+  const destinationBlock = {
+    blockId: rawDestination.blockId || rawDestination.id || '',
+    name: rawDestination.destinationName || rawDestination.name || rawDestination.destination_name || rawDestination.label || 'Unknown',
+    centerLat: rawDestination.centerLat ?? rawDestination.latitude ?? rawDestination.lat ?? 0,
+    centerLon: rawDestination.centerLon ?? rawDestination.longitude ?? rawDestination.lon ?? 0,
+    ...rawDestination,
+  };
+
   return {
     ...backendRide,
-    pickupBlock: backendRide.startBlock || backendRide.pickupBlock,
-    pickupLat: backendRide.startBlock?.latitude || backendRide.pickupLat,
-    pickupLon: backendRide.startBlock?.longitude || backendRide.pickupLon,
-    destinationLat: backendRide.destinationBlock?.latitude || backendRide.destinationLat,
-    destinationLon: backendRide.destinationBlock?.longitude || backendRide.destinationLon,
-  };
+    pickupBlock,
+    pickupLat: rawPickup.latitude ?? rawPickup.lat ?? backendRide.pickupLat,
+    pickupLon: rawPickup.longitude ?? rawPickup.lon ?? backendRide.pickupLon,
+    destinationBlock,
+    destinationLat: rawDestination.latitude ?? rawDestination.lat ?? backendRide.destinationLat,
+    destinationLon: rawDestination.longitude ?? rawDestination.lon ?? backendRide.destinationLon,
+  } as Ride;
 }
 
 class ApiService {
@@ -180,69 +202,80 @@ class ApiService {
   }
 
   /**
-   * Accept a ride request
-   * Uses WebSocket for real-time updates
+   * Accepts a ride request on behalf of a puller.
    */
-  async acceptRide(rideId: number, pullerId: number): Promise<Ride> {
-    // Use WebSocket if connected, otherwise fallback to HTTP
-    if (socketService.isConnected()) {
-      return await socketService.acceptRide(rideId, pullerId);
-    } else {
-      const response = await this.api.post<any>(`/rides/${rideId}/accept`, {
-        pullerId: pullerId.toString(),
+  async acceptRide(startBlockId: string, destinationBlockId: string, pullerId: number): Promise<Ride> {
+    try {
+      const response = await this.api.post(`/rides/accept`, {
+        startBlockId,
+        destinationBlockId,
+        pullerId,
       });
-      return transformRide(response.data);
+
+      // Backend may return the ride directly or wrapped in { ride }
+      const backendRide = response.data?.ride ?? response.data;
+      return transformRide(backendRide);
+    } catch (error) {
+      console.error(`Failed to accept ride via API:`, error);
+      throw error;
     }
   }
 
   /**
-   * Reject a ride request
-   * Uses WebSocket for real-time updates
+   * Mark a ride as picked up (move to ACTIVE)
    */
-  async rejectRide(rideId: number, pullerId: number): Promise<void> {
-    // Use WebSocket if connected, otherwise fallback to HTTP
-    if (socketService.isConnected()) {
-      await socketService.rejectRide(rideId, pullerId);
-    } else {
-      await this.api.post(`/rides/${rideId}/reject`, {
-        pullerId: pullerId.toString(),
-      });
+  async pickupRide(rideId: string | number): Promise<Ride> {
+    try {
+      const response = await this.api.post(`/rides/${rideId}/pickup`);
+      const backendRide = response.data?.ride ?? response.data;
+      return transformRide(backendRide);
+    } catch (error) {
+      console.error('Failed to pickup ride via API:', error);
+      throw error;
     }
   }
 
   /**
-   * Confirm pickup (puller has arrived at pickup location)
-   * Uses WebSocket for real-time updates
+   * Rejects a ride as a puller.
    */
-  async confirmPickup(rideId: number): Promise<Ride> {
-    // Use WebSocket if connected, otherwise fallback to HTTP
-    if (socketService.isConnected()) {
-      return await socketService.confirmPickup(rideId);
-    } else {
-      const response = await this.api.post<any>(`/rides/${rideId}/pickup`);
-      return transformRide(response.data);
+  async rejectRide(rideId: string | number, pullerId: number): Promise<void> {
+    try {
+      // Use WebSocket if connected, otherwise fallback to HTTP
+      if (socketService.isConnected()) {
+        await socketService.rejectRide(Number(rideId), pullerId);
+        return;
+      }
+
+      await this.api.post(`/rides/${rideId}/reject`, { pullerId: pullerId.toString() });
+    } catch (error) {
+      console.error('Failed to reject ride via API:', error);
+      throw error;
     }
   }
 
   /**
-   * Complete a ride
-   * Uses WebSocket for real-time updates
+   * Completes a ride and awards points to the puller.
    */
-  async completeRide(rideId: number, finalLat: number, finalLon: number): Promise<Ride> {
-    // Use WebSocket if connected, otherwise fallback to HTTP
-    if (socketService.isConnected()) {
-      return await socketService.completeRide(rideId, finalLat, finalLon);
-    } else {
-      const response = await this.api.post<any>(`/rides/${rideId}/complete`, {
-        finalLat,
-        finalLon,
-      });
-      return transformRide(response.data);
+  async completeRide(rideId: string, finalLat: number, finalLon: number, pointsOverride?: number): Promise<Ride> {
+    try {
+      // Backend controller expects POST /rides/:id/complete
+      const payload: any = { finalLat, finalLon };
+      if (typeof pointsOverride === 'number') {
+        payload.pointsOverride = pointsOverride;
+      }
+
+      const response = await this.api.post(`/rides/${rideId}/complete`, payload);
+
+      const backendRide = response.data?.ride ?? response.data;
+      return transformRide(backendRide);
+    } catch (error) {
+      console.error('Failed to complete ride via API:', error);
+      throw error;
     }
   }
 
   /**
-   * Get ride history for a puller
+   * Fetches the puller's ride history
    */
   async getRideHistory(pullerId: number, page = 1, limit = 20): Promise<{ data: Ride[]; total: number }> {
     const response = await this.api.get<{ data: any[]; total: number }>(`/pullers/${pullerId}/rides`, {

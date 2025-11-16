@@ -12,6 +12,7 @@ import { PickupScreen, ActiveRideScreen } from './components/RideScreens';
 import { RideCompleteModal } from './components/RideCompleteModal';
 import { RideStatus } from './types';
 import { notificationManager } from './utils/notificationManager';
+import { locationService } from './services/location.service';
 
 /**
  * Main App Component
@@ -34,13 +35,12 @@ function App() {
   const showRideCompleteModal = useAppStore((state) => state.showRideCompleteModal);
   const lastCompletedRide = useAppStore((state) => state.lastCompletedRide);
   
-  const setPuller = useAppStore((state) => state.setPuller);
   const setCurrentRide = useAppStore((state) => state.setCurrentRide);
   const setPendingRequest = useAppStore((state) => state.setPendingRequest);
   const setUserLocation = useAppStore((state) => state.setUserLocation);
   const setShowRideCompleteModal = useAppStore((state) => state.setShowRideCompleteModal);
   const setLastCompletedRide = useAppStore((state) => state.setLastCompletedRide);
-  const updatePullerPoints = useAppStore((state) => state.updatePullerPoints);
+  const setPuller = useAppStore((state) => state.setPuller);
   const removeAvailableRide = useAppStore((state) => state.removeAvailableRide);
 
   const [isLoading, setIsLoading] = useState(false);
@@ -149,46 +149,62 @@ function App() {
   useEffect(() => {
     console.log('🔧 Setting up event handlers...');
     
-    // MQTT: Handle ride requests from broker
+    // MQTT: Handle ride requests from broker (robust to different payload/topic formats)
     const handleMqttRideRequest = (request: any) => {
       console.log('🔔 NEW RIDE REQUEST RECEIVED via MQTT:', request);
       console.log('📦 MQTT Request payload:', JSON.stringify(request, null, 2));
-      
-      // Hardware payload has: blockId, destinationId, timestamp, priority
+
+      // Support multiple payload shapes produced by hardware or backend:
+      // - { startBlockId, destinationBlockId }
+      // - { blockId, destinationId }
+      // - { blockId } (no destination)
+      const pickupBlockId = request.startBlockId || request.blockId || request.from || request.pickupBlockId || null;
+      let destinationBlockId = request.destinationBlockId || request.destinationId || request.to || request.destination || null;
+
+      if (!pickupBlockId) {
+        console.warn('MQTT ride request missing pickup block id — ignoring:', request);
+        return;
+      }
+
+      if (!destinationBlockId) {
+        // If destination is missing, assume it's same as pickup (or unknown)
+        destinationBlockId = pickupBlockId;
+      }
+
       // Transform to match RideRequest interface
       const rideRequest = {
         id: Date.now(), // Generate temporary ID
         pickupBlock: {
-          blockId: request.blockId,
-          name: request.blockId, // Use blockId as name for now
-          centerLat: 0, // Will be set by backend
-          centerLon: 0, // Will be set by backend
+          blockId: pickupBlockId,
+          name: pickupBlockId, // Use id as name for now
+          centerLat: 0,
+          centerLon: 0,
         },
         destinationBlock: {
-          blockId: request.destinationId,
-          name: request.destinationId, // Use destinationId as name for now
-          centerLat: 0, // Will be set by backend
-          centerLon: 0, // Will be set by backend
+          blockId: destinationBlockId,
+          name: destinationBlockId,
+          centerLat: 0,
+          centerLon: 0,
         },
-        pickupLat: 0, // Will be set by backend
-        pickupLon: 0, // Will be set by backend
-        estimatedPoints: 100, // Default points
+        pickupLat: 0,
+        pickupLon: 0,
+        estimatedPoints: typeof request.estimatedPoints === 'number' ? request.estimatedPoints : 100,
         expiresAt: new Date(Date.now() + 1 * 60 * 1000).toISOString(), // 1 minute from now
       };
-      
+
       console.log('✅ Transformed ride request:', rideRequest);
-      
+
       // Show notification with audio and vibration
       notificationManager.showRideRequestNotification({
         rideId: rideRequest.id,
-        from: request.blockId,
-        to: request.destinationId,
+        from: pickupBlockId,
+        to: destinationBlockId,
         points: rideRequest.estimatedPoints,
       });
-      
+
       // Add to available rides (don't auto-show modal)
-      useAppStore.getState().addAvailableRide(rideRequest);
-      
+  useAppStore.getState().addAvailableRide(rideRequest);
+
       console.log('✅ Ride request added to available rides');
     };
 
@@ -301,38 +317,29 @@ function App() {
   const handleAcceptRideFromModal = async (rideId: number) => {
     if (!puller) return;
 
-    console.log(`✅ Accepting ride ${rideId} for puller ${puller.id}`);
+    const rideRequest = availableRides.find(r => r.id === rideId);
+    if (!rideRequest) {
+      console.error(`Ride request with ID ${rideId} not found in available rides.`);
+      alert('Ride request not found. It might have expired.');
+      return;
+    }
+
+    console.log(`✅ Accepting ride from ${rideRequest.pickupBlock.blockId} to ${rideRequest.destinationBlock.blockId} for puller ${puller.id}`);
     setIsLoading(true);
     
     try {
-      // Find the ride request to get its details
-      const rideRequest = availableRides.find(r => r.id === rideId);
-      if (!rideRequest) {
-        throw new Error('Ride not found');
+      const acceptedRide = await apiService.acceptRide(rideRequest.pickupBlock.blockId, rideRequest.destinationBlock.blockId, puller.id);
+
+      console.log('✅ Ride accepted successfully (API):', acceptedRide);
+
+      // Preserve the UI's estimatedPoints from the rideRequest so it can be
+      // used later when completing the ride (frontend may show 100 points)
+      try {
+        (acceptedRide as any).estimatedPoints = rideRequest.estimatedPoints;
+      } catch (e) {
+        // ignore
       }
-      
-      // For MQTT-only mode: Create a mock accepted ride
-      const acceptedRide = {
-        id: rideId,
-        status: RideStatus.ACCEPTED,
-        requestTime: new Date().toISOString(),
-        acceptTime: new Date().toISOString(),
-        pickupTime: null,
-        completionTime: null,
-        pointsAwarded: null,
-        pickupBlock: rideRequest.pickupBlock,
-        destinationBlock: rideRequest.destinationBlock,
-        puller: puller,
-        pickupLat: rideRequest.pickupLat,
-        pickupLon: rideRequest.pickupLon,
-        destinationLat: rideRequest.destinationBlock.centerLat,
-        destinationLon: rideRequest.destinationBlock.centerLon,
-        finalLat: null,
-        finalLon: null,
-      };
-      
-      console.log('✅ Ride accepted successfully (MQTT mode):', acceptedRide);
-      
+
       setCurrentRide(acceptedRide);
       removeAvailableRide(rideId);
       setShowAvailableRidesModal(false);
@@ -357,10 +364,23 @@ function App() {
     if (!puller) return;
 
     console.log(`❌ Rejecting ride ${rideId} for puller ${puller.id}`);
-    
-    // For MQTT-only mode: Just remove from list
-    removeAvailableRide(rideId);
-    console.log('✅ Ride rejected successfully (MQTT mode)');
+    setIsLoading(true);
+
+    try {
+      // Call backend (or WebSocket) to record rejection and trigger redistribution
+      await apiService.rejectRide(rideId, puller.id);
+
+      // Remove from UI list regardless
+      removeAvailableRide(rideId);
+
+      console.log('✅ Ride rejected successfully (API/WebSocket)');
+    } catch (error) {
+      console.error('❌ Failed to reject ride via API:', error);
+      // Still remove locally to avoid stale UI if backend is unreachable
+      removeAvailableRide(rideId);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   /**
@@ -420,11 +440,21 @@ function App() {
     if (!pendingRequest || !puller) return;
 
     console.log(`❌ Rejecting pending ride ${pendingRequest.id} for puller ${puller.id}`);
-    
-    // For MQTT-only mode: Just clear pending and remove from list
-    setPendingRequest(null);
-    removeAvailableRide(pendingRequest.id);
-    console.log('✅ Ride rejected successfully (MQTT mode)');
+    setIsLoading(true);
+
+    try {
+      await apiService.rejectRide(pendingRequest.id, puller.id);
+      setPendingRequest(null);
+      removeAvailableRide(pendingRequest.id);
+      console.log('✅ Ride rejected successfully (API/WebSocket)');
+    } catch (error) {
+      console.error('❌ Failed to reject pending ride via API:', error);
+      // Clear locally to keep UI responsive
+      setPendingRequest(null);
+      removeAvailableRide(pendingRequest.id);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   /**
@@ -444,18 +474,28 @@ function App() {
     setIsLoading(true);
     
     try {
-      // For MQTT-only mode: Update ride status to ACTIVE
-      const updatedRide = {
+      // Call backend API to mark ride as picked up (ACTIVE)
+      const updatedRide = await apiService.pickupRide(String(currentRide.id));
+
+      console.log('✅ Pickup confirmed (API):', updatedRide);
+
+      // Merge updated fields from backend but DO NOT overwrite map-related
+      // coordinates and block objects coming from the current UI state.
+      // Some backend responses may omit or shrink these fields which causes
+      // markers to disappear — preserve the frontend values explicitly.
+      const mergedRide = {
         ...currentRide,
-        status: RideStatus.ACTIVE,
-        pickupTime: new Date().toISOString(),
-        // Update map markers: Now navigate to destination instead of pickup
-        pickupLat: currentRide.destinationLat || 23.8103, // Use destination as new target
-        pickupLon: currentRide.destinationLon || 90.4125,
+        ...updatedRide,
+        // Always preserve frontend coordinates/blocks to keep markers stable
+        pickupLat: currentRide.pickupLat,
+        pickupLon: currentRide.pickupLon,
+        destinationLat: currentRide.destinationLat,
+        destinationLon: currentRide.destinationLon,
+        pickupBlock: currentRide.pickupBlock,
+        destinationBlock: currentRide.destinationBlock,
       };
-      
-      console.log('✅ Pickup confirmed (MQTT mode), now heading to destination');
-      setCurrentRide(updatedRide);
+
+      setCurrentRide(mergedRide);
     } catch (error) {
       console.error('❌ Failed to confirm pickup:', error);
       alert('Failed to confirm pickup. Please try again.');
@@ -470,54 +510,59 @@ function App() {
   const handleCompleteRide = async () => {
     if (!currentRide || !puller) return;
 
-    console.log('🏁 Completing ride:', currentRide.id);
     setIsLoading(true);
-    
     try {
-      // Use fallback coordinates for completion
-      const mockLat = currentRide.destinationLat || 23.8103;
-      const mockLon = currentRide.destinationLon || 90.4125;
-      
-      console.log(`🎯 Completing ride with coordinates: ${mockLat}, ${mockLon}`);
-      
-      // Calculate points (mock calculation)
-      const pointsAwarded = currentRide.pickupBlock?.name && currentRide.destinationBlock?.name 
-        ? 100 
-        : 50;
-      
-      console.log(`💰 Points awarded: ${pointsAwarded}`);
-      
-      // Update puller points via API
-      try {
-        const newBalance = puller.pointsBalance + pointsAwarded;
-        const updatedPuller = await apiService.updatePullerPoints(puller.id, newBalance);
-        setPuller(updatedPuller);
-        console.log(`✅ Puller points updated: ${puller.pointsBalance} → ${newBalance}`);
-      } catch (apiError) {
-        console.error('❌ Failed to update points via API:', apiError);
-        // Update locally even if API fails
-        updatePullerPoints(puller.pointsBalance + pointsAwarded);
-      }
-      
-      // Create completed ride for modal
-      const completedRide = {
+      // Get mock location for completion
+      const { lat: mockLat, lon: mockLon } = locationService.getMockLocation();
+
+      // Determine optional override points (use estimatedPoints from UI if available)
+      // Ensure we pass a number to the API (apiService only attaches pointsOverride when typeof number)
+      const rawEstimated = (currentRide as any)?.estimatedPoints ?? currentRide.pointsAwarded ?? undefined;
+      const numericOverride = typeof rawEstimated === 'number' ? rawEstimated : Number(rawEstimated);
+      const overridePoints = Number.isFinite(numericOverride) ? Math.max(0, Math.floor(numericOverride)) : undefined;
+
+      // Call the API to complete the ride (pass override when available)
+      const completedRideData = await apiService.completeRide(String(currentRide.id), mockLat, mockLon, overridePoints);
+
+      // Merge backend response but preserve map coordinates and blocks if backend omits them
+      const mergedCompletedRide = {
         ...currentRide,
+        ...completedRideData,
         status: RideStatus.COMPLETED,
         completionTime: new Date().toISOString(),
-        pointsAwarded: pointsAwarded,
-        finalLat: mockLat,
-        finalLon: mockLon,
-        puller: { ...puller, pointsBalance: puller.pointsBalance + pointsAwarded },
+        // Preserve coordinates/blocks if backend didn't include them
+        pickupLat: completedRideData.pickupLat ?? currentRide.pickupLat,
+        pickupLon: completedRideData.pickupLon ?? currentRide.pickupLon,
+        destinationLat: completedRideData.destinationLat ?? currentRide.destinationLat,
+        destinationLon: completedRideData.destinationLon ?? currentRide.destinationLon,
+        pickupBlock: completedRideData.pickupBlock ?? currentRide.pickupBlock,
+        destinationBlock: completedRideData.destinationBlock ?? currentRide.destinationBlock,
+        finalLat: completedRideData.finalLat ?? currentRide.finalLat,
+        finalLon: completedRideData.finalLon ?? currentRide.finalLon,
       };
-      
+
+      // Update puller balance using awarded points from backend (or 0)
+      const awarded = completedRideData?.pointsAwarded ?? 0;
+
+      // Update global puller state so HomeScreen and other components show the new balance immediately
+      if (puller) {
+        const updatedPuller = { ...puller, pointsBalance: (puller.pointsBalance || 0) + awarded };
+        setPuller(updatedPuller);
+      }
+
+      const completedRide = {
+        ...mergedCompletedRide,
+        puller: puller ? { ...puller, pointsBalance: (puller.pointsBalance || 0) + awarded } : mergedCompletedRide.puller,
+      };
+
       // Show completion notification
-      notificationManager.showRideCompletedNotification(pointsAwarded);
-      
+      notificationManager.showRideCompletedNotification(awarded);
+
       // Show completion modal
       setLastCompletedRide(completedRide);
       setShowRideCompleteModal(true);
       setCurrentRide(null);
-      
+
       console.log('✅ Ride completed successfully');
     } catch (error) {
       console.error('❌ Failed to complete ride:', error);

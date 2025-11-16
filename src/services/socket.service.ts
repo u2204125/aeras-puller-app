@@ -245,8 +245,15 @@ class SocketService {
         return;
       }
 
+      // Safety timeout: if server doesn't respond within 5s, resolve to avoid UI blocking
+      const timeout = setTimeout(() => {
+        console.warn('⚠️ rejectRide timed out waiting for server acknowledgement');
+        resolve();
+      }, 5000);
+
       this.socket.emit('reject_ride', { rideId, pullerId }, (response: any) => {
-        if (response.event === 'error') {
+        clearTimeout(timeout);
+        if (response && response.event === 'error') {
           reject(new Error(response.data.message));
         } else {
           console.log('✅ Ride rejected via WebSocket');

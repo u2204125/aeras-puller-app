@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { MapContainer, TileLayer, Marker, Polyline } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Polyline, CircleMarker } from 'react-leaflet';
 import { Ride } from '../types';
 import { useAppStore } from '../store/appStore';
 import { isWithinProximity, formatDistance, calculateDistance } from '../utils/geolocation';
@@ -89,10 +89,25 @@ export const PickupScreen: React.FC<PickupScreenProps> = ({ ride, onConfirmPicku
   };
 
   // Use demo coordinates if real ones are missing or invalid
-  const pickupLocation: [number, number] = 
-    ride.pickupLat && ride.pickupLon && ride.pickupLat !== 0 && ride.pickupLon !== 0
-      ? [ride.pickupLat, ride.pickupLon]
+  // Prefer explicit lat/lon fields, then block center fields, then legacy names
+  const pickupLatVal =
+    (ride.pickupLat && Math.abs(ride.pickupLat) > 0.000001 && ride.pickupLat) ||
+    (ride.pickupBlock && (ride.pickupBlock.centerLat as any)) ||
+  (ride.pickupBlock && ((ride.pickupBlock as any).latitude)) ||
+    null;
+  const pickupLonVal =
+    (ride.pickupLon && Math.abs(ride.pickupLon) > 0.000001 && ride.pickupLon) ||
+    (ride.pickupBlock && (ride.pickupBlock.centerLon as any)) ||
+  (ride.pickupBlock && ((ride.pickupBlock as any).longitude)) ||
+    null;
+
+  const pickupLocation: [number, number] =
+    pickupLatVal !== null && pickupLonVal !== null
+      ? [pickupLatVal as number, pickupLonVal as number]
       : [23.8103, 90.4125]; // Dhaka demo coordinates
+
+  // Debug log to help trace missing coordinates
+  console.log('📍 Pickup render coords:', { pickupLatVal, pickupLonVal, pickupBlock: ride.pickupBlock });
 
   const currentLocation: [number, number] = userLocation
     ? [userLocation.latitude, userLocation.longitude]
@@ -109,6 +124,7 @@ export const PickupScreen: React.FC<PickupScreenProps> = ({ ride, onConfirmPicku
           zoomControl={false}
           style={{ height: '100%', width: '100%' }}
           key={`pickup-${ride.id}`}
+          
         >
           {/* Use CartoDB Dark Matter for navigation-style map */}
           <TileLayer
@@ -139,6 +155,10 @@ export const PickupScreen: React.FC<PickupScreenProps> = ({ ride, onConfirmPicku
               iconAnchor: [10, 10],
             })}
           />
+
+          {/* Always-visible debug circle markers (fallback) */}
+          <CircleMarker center={pickupLocation} radius={10} pathOptions={{ color: '#ffffff', fillColor: '#22c55e', fillOpacity: 1 }} />
+          <CircleMarker center={currentLocation} radius={8} pathOptions={{ color: '#ffffff', fillColor: '#3b82f6', fillOpacity: 1 }} />
           
           {/* Route Line */}
           <Polyline
@@ -309,9 +329,23 @@ export const ActiveRideScreen: React.FC<ActiveRideScreenProps> = ({
 
   // Use demo coordinates if real ones are missing or invalid
   const destinationLocation: [number, number] = 
-    ride.destinationLat && ride.destinationLon && ride.destinationLat !== 0 && ride.destinationLon !== 0
-      ? [ride.destinationLat, ride.destinationLon]
-      : [23.8200, 90.4200]; // Dhaka demo destination
+    (() => {
+      const destLatVal =
+        (ride.destinationLat && Math.abs(ride.destinationLat) > 0.000001 && ride.destinationLat) ||
+  (ride.destinationBlock && (ride.destinationBlock.centerLat as any)) ||
+  (ride.destinationBlock && ((ride.destinationBlock as any).latitude)) ||
+        null;
+      const destLonVal =
+        (ride.destinationLon && Math.abs(ride.destinationLon) > 0.000001 && ride.destinationLon) ||
+  (ride.destinationBlock && (ride.destinationBlock.centerLon as any)) ||
+  (ride.destinationBlock && ((ride.destinationBlock as any).longitude)) ||
+        null;
+
+      console.log('📍 Destination render coords:', { destLatVal, destLonVal, destinationBlock: ride.destinationBlock });
+
+      if (destLatVal !== null && destLonVal !== null) return [destLatVal as number, destLonVal as number];
+      return [23.8200, 90.4200];
+    })(); // Dhaka demo destination
 
   const currentLocation: [number, number] = userLocation
     ? [userLocation.latitude, userLocation.longitude]
@@ -367,6 +401,10 @@ export const ActiveRideScreen: React.FC<ActiveRideScreenProps> = ({
             opacity={0.9}
             dashArray="10, 5"
           />
+
+          {/* Always-visible debug circle markers (fallback) */}
+          <CircleMarker center={destinationLocation} radius={10} pathOptions={{ color: '#ffffff', fillColor: '#ef4444', fillOpacity: 1 }} />
+          <CircleMarker center={currentLocation} radius={8} pathOptions={{ color: '#ffffff', fillColor: '#3b82f6', fillOpacity: 1 }} />
         </MapContainer>
       </div>
 
